@@ -12,11 +12,11 @@ FastAPI + httpx 实现的单进程 HTTP 缓存代理与配套演示环境。代�
 │   ├── cachestore.py     # 内存缓存 + 同键在途合并 + 代际（epoch）清除
 │   ├── policy.py         # Cache-Control 解析与缓存资格判定
 │   └── static/index.html # 演示页（浏览器入口，原生 JS，无外链依赖）
-├── upstream/app.py       # 本地上游：公开/个人切换、延迟、500 失败、请求审计
+├── upstream/app.py       # 本地上游：公开/个人切换、延迟、500/间歇失败、请求审计
 ├── scripts/
 │   ├── run-local.sh      # 无 Docker 时本地启动（uvicorn 双进程）
 │   ├── stop-local.sh
-│   ├── verify.py         # 端到端行为验证（50 项断言，仅用 stdlib）
+│   ├── verify.py         # 端到端行为验证（66 项断言，仅用 stdlib）
 │   └── test_units.py     # 单元测试（策略解析 + 存储/代际逻辑，17 项）
 ├── Dockerfile            # 代理与上游共用同一镜像
 ├── docker-compose.yml    # 一键环境（代理 :8000，上游 :8001）
@@ -69,8 +69,12 @@ PROXY_ADDR=127.0.0.1:8000 UPSTREAM_ADDR=127.0.0.1:8001 \
 | 有 `Set-Cookie` 不缓存 | 资格判定硬性拒绝；缓存条目写入前再过滤一次 Set-Cookie |
 | 过期不复用 | `CachedResponse.expires_at` 单调时钟判定；`lookup` 命中过期条目立即剔除并走上游 |
 | 同键并发未命中只请求上游一次 | `CacheStore.lookup` 返回 leader/wait；wait 等待同一个 `asyncio.Future` |
+| 只有符合缓存准入规则的响应才共享给等待者 | `_leader_work` 完成共享取数后按 `cache_eligibility` 判定，future 载荷为 `InFlightOutcome(shareable=...)`；可共享时等待者标记 `MISS-WAIT` |
+| 不准入的非 5xx 响应只交给首请求，等待者拆分独立取数 | 等待者收到 `shareable=False` 的决议后走 `_solo_fetch`：各自请求上游一次，不合并、不读写缓存，标记 `MISS-SPLIT`；首请求本人仍是 `MISS-NO-CACHE` |
+| 拆分后某个请求失败或取消不影响其他人 | 独立取数在各请求自己的路由任务中执行；5xx/传输异常只让该请求得 502，取消只取消自己 |
+| 原共享取数失败仍让全批返回 502 | 传输异常与上游 5xx 均走 `fail_all`：移除在途单元、future 以异常结束，所有等待者收到 502 `X-Cache: ERROR` |
+| 后续请求不加入已结束的批次 | `store_if_current` / `fail_all` 先在锁内从 `_inflight` 移除单元，再完成 future；此后到达的同键请求只会开新批次 |
 | 一个等待者断开不影响其他人 | 上游请求在独立 `asyncio.Task`（`_leader_work`）中执行；路由任务被取消不会取消它，future 照常回填 |
-| 失败不缓存且结束所有等待 | 传输异常与上游 5xx 均走 `fail_all`：移除在途单元、future 以异常结束，所有等待者收到 502 `X-Cache: ERROR` |
 | 按公告清除全部语言缓存 | `POST /proxy/purge/{id}` 删除该公告所有语言条目 |
 | 清除后旧在途不得回填 | 每个公告维护 generation（epoch），清除即 +1 并把存活在途标记 `purged`；`store_if_current` 代际不符/已标记则拒绝写入 |
 | 清除后不得复用旧在途结果 | 新请求 `lookup` 看到新一代际，创建全新在途单元并重新请求上游 |
@@ -78,10 +82,14 @@ PROXY_ADDR=127.0.0.1:8000 UPSTREAM_ADDR=127.0.0.1:8001 \
 ### 响应头观测口径
 
 - `X-Cache`：`HIT` / `MISS`（未命中且已缓存）/ `MISS-NO-CACHE`（未命中但不可缓存）
-  / `MISS-WAIT`（合并到他人在途请求）/ `BYPASS`（带身份直连）/ `ERROR`（上游失败）；
-- `X-Cache-Reason`：不可缓存或绕过的具体原因；
+  / `MISS-WAIT`（合并等待并共享了可缓存响应）/ `MISS-SPLIT`（首请求响应不可缓存，
+  被拆分后独立取数）/ `BYPASS`（带身份直连）/ `ERROR`（上游失败）；
+- `X-Cache-Reason`：不可缓存、拆分或绕过的具体原因；
 - `X-Cache-Key`、`Age`：仅 HIT 时返回；
-- `X-Upstream-Request-Id`：透传上游请求 ID，同一次合并的所有等待者该值相同。
+- `X-Upstream-Request-Id`：透传上游请求 ID。可缓存响应被共享时，同批所有等待者
+  该值相同；个人公告被拆分后，每个请求该值都不同（各自独立取数的证据）；
+- `X-Session-Preview`：上游 personal 响应的会话回显（Set-Cookie 对浏览器 JS
+  不可见，此头仅供演示页展示"每个访客拿到各自的 SESSION"），不进入缓存。
 
 ## 演示页使用指引（http://localhost:8000/）
 
@@ -89,11 +97,19 @@ PROXY_ADDR=127.0.0.1:8000 UPSTREAM_ADDR=127.0.0.1:8001 \
    Authorization / 两者），可一键发起 6 个同键并发请求验证合并；
 2. **按公告清除**：输入公告 ID 清除其全部语言缓存；“清除中并发演示”会自动制造
    2.5s 在途延迟并在在途期间清除，可观察 `purged` 标记、无回填、新请求重新打上游；
-3. **上游控制**：切换 public/personal、人工延迟、500 失败、max-age，可只对单个公告
-   生效；四个预设按钮覆盖典型场景；
-4. **代理内部状态**：实时展示缓存条目（含剩余寿命、代际）、在途合并单元、generation；
-5. **上游请求审计**：展示上游实际收到的每一个请求及 Cookie/Auth 携带情况，用于核对
-   “HIT 不打上游、合并只打一次、绕过每次都打”。
+3. **上游控制**：切换 public/personal、人工延迟、失败模式（正常 / 全部 500 /
+   间歇失败每 N 个失败 1 次）、max-age，可只对单个公告生效；四个预设按钮覆盖典型场景；
+4. **匿名并发演示（修复验证）**：三个一键场景，全部以 `credentials:'omit'` 发起
+   （不携带、不保存浏览器 Cookie）——
+   - **公开公告 · 并发 6**：1 个 `MISS` + 5 个 `MISS-WAIT`，同一上游 ID，上游仅 +1 次；
+   - **个人公告 · 并发 6**：1 个 `MISS-NO-CACHE` + 5 个 `MISS-SPLIT`，6 个不同上游 ID、
+     6 个不同 SESSION，上游 +6 次（首请求的个人正文与 Set-Cookie 不再共享）；
+   - **个人 + 间歇失败 · 并发 6**：拆分后独立取数部分 502（`ERROR`），其余 200 不受影响；
+   结果表格逐一展示每个请求的状态、`X-Cache`、上游请求 ID、SESSION 回显与耗时，
+   并汇总上游实际请求次数增量；
+5. **代理内部状态**：实时展示缓存条目（含剩余寿命、代际）、在途合并单元、generation；
+6. **上游请求审计**：展示上游实际收到的每一个请求及 Cookie/Auth 携带情况，用于核对
+   “HIT 不打上游、合并只打一次、拆分各打各的、绕过每次都打”。
 
 ### 推荐手工验证路径
 
@@ -101,6 +117,10 @@ PROXY_ADDR=127.0.0.1:8000 UPSTREAM_ADDR=127.0.0.1:8001 \
 - 切换语言：各自独立缓存；
 - 选择“携带 Cookie”：始终 `BYPASS`，上游审计每次都新增，且之后匿名请求仍 `HIT`；
 - 上游切 personal：匿名也返回 `MISS-NO-CACHE`，原因是含 Set-Cookie 且 `private,no-store`；
+- **personal 下并发 6 个匿名请求**（演示区一键场景）：首请求 `MISS-NO-CACHE`，其余
+  5 个 `MISS-SPLIT`，上游审计新增 6 条、每条 SESSION 不同——修复前所有等待者会
+  收到首请求那一份个人正文与 Set-Cookie；
+- **personal + 间歇失败并发**：拆分出的独立取数各自成败，部分 502 不影响其余 200；
 - 上游切 500：并发 6 个请求全部 502/`ERROR`，恢复后重新请求正常，失败从未被缓存；
 - 高延迟下并发 6 请求：仅 1 个 `MISS`、5 个 `MISS-WAIT`，总耗时≈一次上游延迟；
 - 在途清除演示：旧等待者拿到当时响应，但缓存不回填；清除后的新请求是全新 `MISS`。
@@ -109,6 +129,10 @@ PROXY_ADDR=127.0.0.1:8000 UPSTREAM_ADDR=127.0.0.1:8001 \
 
 - 单进程内存缓存，不做跨进程共享；进程重启缓存即清空，符合运维缓存定位；
 - 缓存只保存白名单响应头并剔除逐跳头与 `Set-Cookie`，body 完整缓冲后再释放上游连接；
-- 上游 5xx 按失败处理（502 交给客户端、不缓存、结束所有等待）；4xx（如 404）为成功
-  送达的响应，因非 200 不可缓存，标记 `MISS-NO-CACHE`；
+- 同键合并在**响应分发**阶段按缓存准入规则分流：准入的响应才共享给等待者；
+  不准入的非 5xx 响应（个人公告、404、非法 Cache-Control 等）只交给首请求，
+  等待者各自独立取数一次，不合并、不缓存——个人正文与 Set-Cookie 绝不跨访客共享；
+- 上游 5xx 按失败处理：共享取数遇 5xx/传输异常，全批 502、不缓存；拆分后的独立
+  取数各自独立成败，单个 502/取消不影响其他请求；
+- 4xx（如 404）为成功送达的响应，因非 200 不可缓存，标记 `MISS-NO-CACHE`；
 - 演示管理接口（`/proxy/*`、上游 `/admin/*`）仅用于内网演示环境，不应暴露到公网。

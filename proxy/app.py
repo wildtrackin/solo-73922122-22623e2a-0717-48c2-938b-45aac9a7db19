@@ -6,8 +6,12 @@
   匿名请求合并。
 - 匿名响应仅在 200 + Cache-Control 含 public 且含合法非负整数 max-age、
   无 private/no-store、无 Set-Cookie 时缓存；过期不复用。
-- 同键并发未命中只请求上游一次；单个等待者断开不影响其他等待者；
-  上游失败不缓存并结束所有等待。
+- 同键并发未命中只请求上游一次；但响应只在符合缓存准入规则时才共享给
+  等待者。不准入的非 5xx 响应（如个人公告的 Set-Cookie/private）只交给
+  首请求，其余等待者各自独立取数一次：不合并、不缓存，各自成功或 502，
+  互不影响。共享取数本身失败（传输异常 / 上游 5xx）仍让全批返回 502。
+- 单个等待者断开不影响其他等待者；在途单元结束后（回填或失败）即关闭，
+  后续请求不会加入已结束的批次。
 - 按公告清除会删除该公告全部语言缓存，并使清除前的在途响应无法回填、
   清除后的新请求无法复用旧在途结果。
 """
@@ -60,6 +64,7 @@ PASS_RESPONSE_HEADERS = {
     "x-upstream-request-id",
     "x-notice-id",
     "x-notice-kind",
+    "x-session-preview",
 }
 
 HOP_BY_HOP = {
@@ -89,6 +94,21 @@ class FetchResult:
     body: bytes
     headers: list[tuple[str, str]]
     request_id: str | None
+
+
+@dataclass
+class InFlightOutcome:
+    """共享取数完成后的分发决议（inflight.future 的结果载荷）。
+
+    shareable=True：响应符合缓存准入规则，可共享给同批全部等待者。
+    shareable=False：不准入（如个人公告的 Set-Cookie/private、非 200、
+    非法 Cache-Control）。此时 result 只交给首请求（leader）本人；
+    等待者不得使用它，必须各自独立取数。
+    """
+
+    result: FetchResult
+    shareable: bool
+    reason: str
 
 
 @app.on_event("startup")
@@ -152,11 +172,9 @@ async def _fetch_upstream(request: Request, notice_id: str) -> FetchResult:
 
 
 def _build_cached_entry(
-    result: FetchResult, generation: int
-) -> CachedResponse | None:
-    ok, _reason, max_age = cache_eligibility(result.status_code, result.headers)
-    if not ok or max_age is None:
-        return None
+    result: FetchResult, generation: int, max_age: int
+) -> CachedResponse:
+    """把已判定可缓存（max_age 由 cache_eligibility 给出）的响应转为缓存条目。"""
     safe_headers = [
         (k.encode("latin-1"), v.encode("latin-1"))
         for k, v in _filter_response_headers(
@@ -186,10 +204,16 @@ class UpstreamFailure(Exception):
 async def _leader_work(
     inflight: InFlight, request: Request, notice_id: str
 ) -> None:
-    """独立任务执行上游请求；任何等待者（含 leader 客户端）断开都不会取消它。
+    """独立任务执行共享取数；任何等待者（含 leader 客户端）断开都不会取消它。
 
-    成功且可缓存：仅在仍是当前代际时回填，再交付全部等待者。
-    传输异常 / 上游 5xx：不缓存，以异常结束所有等待者。
+    分发规则：
+    - 传输异常 / 上游 5xx：不缓存，以异常结束所有等待者（全批 502）。
+    - 响应符合缓存准入：仅在仍是当前代际时回填，并共享给全部等待者。
+    - 响应不准入（非 5xx）：不缓存、不共享；结果只随决议交给首请求，
+      等待者收到决议后各自独立取数。
+
+    无论走哪条分支，都先在 store 中关闭本批次（移除在途单元），再完成
+    future——后续请求不会加入已结束的批次。
     """
     try:
         result = await _fetch_upstream(request, notice_id)
@@ -200,12 +224,21 @@ async def _leader_work(
         if not inflight.future.done():
             inflight.future.set_exception(exc)
         return
+    shareable, reason, max_age = cache_eligibility(
+        result.status_code, result.headers
+    )
     try:
-        entry = _build_cached_entry(result, inflight.generation)
+        entry = (
+            _build_cached_entry(result, inflight.generation, max_age)
+            if shareable and max_age is not None
+            else None
+        )
         await store.store_if_current(inflight, entry)
     finally:
         if not inflight.future.done():
-            inflight.future.set_result(result)
+            inflight.future.set_result(
+                InFlightOutcome(result=result, shareable=shareable, reason=reason)
+            )
 
 
 def _live_response(
@@ -230,6 +263,34 @@ def _error_response(message: str, status: int = 502) -> JSONResponse:
         status_code=status,
         content={"detail": message, "upstream": UPSTREAM_BASE},
         headers={"X-Cache": "ERROR"},
+    )
+
+
+async def _solo_fetch(
+    request: Request, notice_id: str, *, shared_reason: str
+) -> Response:
+    """批次拆分后的独立取数：不读缓存、不写缓存、不与他人合并。
+
+    仅用于"首请求的共享响应不准入缓存"的场景（如个人公告）。每个等待者
+    各取各的：成功（含 4xx）按上游原样交付并标记 MISS-SPLIT；上游 5xx /
+    传输异常只让本请求得到 502，不影响其他拆分出的请求；本任务被取消
+    （客户端断开）也只影响自己。
+    """
+    try:
+        result = await _fetch_upstream(request, notice_id)
+    except httpx.HTTPError as exc:
+        return _error_response(f"upstream error (split): {exc}")
+    if result.status_code >= 500:
+        return _error_response(
+            f"upstream responded {result.status_code} (split)"
+        )
+    return _live_response(
+        result,
+        cache_status="MISS-SPLIT",
+        reason=(
+            f"shared response not cacheable ({shared_reason}); "
+            "fetched independently"
+        ),
     )
 
 
@@ -276,7 +337,7 @@ async def proxy_notice(notice_id: str, request: Request) -> Response:
     # ---- 2) 已有同键在途：加入等待，不发新的上游请求 ----
     if isinstance(decision, CacheWait):
         try:
-            result = await decision.inflight.future
+            outcome = await decision.inflight.future
         except UpstreamFailure as exc:
             return _error_response(
                 f"upstream responded {exc.result.status_code} (shared)"
@@ -285,13 +346,20 @@ async def proxy_notice(notice_id: str, request: Request) -> Response:
             return _error_response(f"upstream error (shared): {exc}")
         except Exception as exc:  # noqa: BLE001
             return _error_response(f"shared request failed: {exc}")
-        return _live_response(
-            result,
-            cache_status="MISS-WAIT",
-            reason="coalesced with in-flight request",
+        if outcome.shareable:
+            # 符合缓存准入的响应才可共享给等待者
+            return _live_response(
+                outcome.result,
+                cache_status="MISS-WAIT",
+                reason="coalesced with in-flight request",
+            )
+        # 首请求的响应不准入缓存（如个人公告）：绝不共享其正文/Set-Cookie，
+        # 本请求独立取数一次，不合并、不缓存。
+        return await _solo_fetch(
+            request, notice_id, shared_reason=outcome.reason
         )
 
-    # ---- 3) leader：发起唯一的上游请求 ----
+    # ---- 3) leader：发起唯一的共享取数 ----
     # 独立任务 + 等待 future：leader 客户端断开只会取消路由处理任务，
     # 不会取消 leader_work，其他等待者照常得到结果。
     assert isinstance(decision, CacheLeader)
@@ -299,7 +367,7 @@ async def proxy_notice(notice_id: str, request: Request) -> Response:
     task = asyncio.create_task(_leader_work(inflight, request, notice_id))
     inflight.leader_task = task
     try:
-        result = await inflight.future
+        outcome = await inflight.future
     except UpstreamFailure as exc:
         return _error_response(
             f"upstream responded {exc.result.status_code}"
@@ -309,11 +377,10 @@ async def proxy_notice(notice_id: str, request: Request) -> Response:
     except Exception as exc:  # noqa: BLE001
         return _error_response(f"upstream request failed: {exc}")
 
-    ok, reason, _ = cache_eligibility(result.status_code, result.headers)
     return _live_response(
-        result,
-        cache_status="MISS" if ok else "MISS-NO-CACHE",
-        reason=reason,
+        outcome.result,
+        cache_status="MISS" if outcome.shareable else "MISS-NO-CACHE",
+        reason=outcome.reason,
     )
 
 

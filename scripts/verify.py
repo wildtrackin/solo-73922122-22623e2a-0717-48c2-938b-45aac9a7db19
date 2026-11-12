@@ -12,6 +12,9 @@
   7. 过期不复用
   8. 按公告清除全部语言；旧在途不回填；清除后不复用旧在途
   9. 各种非法 Cache-Control 不缓存
+ 10. 匿名合并的响应分发：不准入的响应只给首请求，等待者拆分独立取数
+ 11. 拆分后独立取数部分失败互不影响（间歇失败）
+ 12. 批次结束后新请求不加入旧批次
 """
 from __future__ import annotations
 
@@ -310,6 +313,94 @@ def main() -> int:
                            {"Accept-Language": "zh-CN"})
     check("404 不缓存", h404.get("x-cache") == "MISS-NO-CACHE",
           h404.get("x-cache"))
+
+    section("11. 匿名合并的响应分发：personal 响应只给首请求，等待者拆分独立取数")
+    admin_post("/admin/config", {"notice_id": "2", "profile": "personal",
+                                 "failure": "none", "latency_ms": 800})
+    urllib.request.urlopen(urllib.request.Request(
+        f"http://{PROXY}/proxy/purge/2", data=b"", method="POST"),
+        timeout=10).read()
+    n0 = upstream_count()
+    box11: list = []
+    threads = [
+        threading.Thread(target=lambda: box11.append(
+            proxy_get("/notices/2", {"Accept-Language": "zh-CN"}, timeout=20)))
+        for _ in range(6)
+    ]
+    t0 = time.monotonic()
+    for t in threads: t.start()
+    for t in threads: t.join()
+    elapsed = time.monotonic() - t0
+    tags11 = [r[1].get("x-cache") for r in box11]
+    check("6 个并发全部 200", all(r[0] == 200 for r in box11),
+          str([r[0] for r in box11]))
+    check("恰好 1 个 MISS-NO-CACHE（首请求）+ 5 个 MISS-SPLIT（拆分）",
+          tags11.count("MISS-NO-CACHE") == 1 and tags11.count("MISS-SPLIT") == 5,
+          str(tags11))
+    check("上游收到 6 次请求（1 次共享取数 + 5 次独立取数）",
+          upstream_count() - n0 == 6, f"delta={upstream_count() - n0}")
+    rids11 = [r[1].get("x-upstream-request-id") for r in box11]
+    check("6 个响应的上游 ID 全不同（未共享首请求的响应）",
+          len(set(rids11)) == 6, str(rids11))
+    cookies11 = [r[1].get("set-cookie", "") for r in box11]
+    check("每个响应都带各自的 Set-Cookie", all("SESSION=user-" in c
+                                               for c in cookies11),
+          str(cookies11))
+    check("6 个 SESSION 全不同（个人响应未串号）",
+          len(set(cookies11)) == 6, str(cookies11))
+    check("Set-Cookie 与各自上游 ID 对应",
+          all(f"SESSION=user-{rid}" in c
+              for rid, c in zip(rids11, cookies11)),
+          str(list(zip(rids11, cookies11))))
+    check("拆分后独立取数并发执行（总耗时≈2 倍单次延迟，而非 6 倍）",
+          elapsed < 4.0, f"{elapsed:.2f}s")
+
+    section("12. 拆分后独立取数部分失败互不影响（intermittent）")
+    # fail_every=2：配置后第 1 个请求（首请求的共享取数）必成功，
+    # 之后拆分出的 5 次独立取数中第 2/4/6 个失败 -> 3 个 502
+    admin_post("/admin/config", {"notice_id": "2", "profile": "personal",
+                                 "failure": "intermittent", "fail_every": 2,
+                                 "latency_ms": 300})
+    urllib.request.urlopen(urllib.request.Request(
+        f"http://{PROXY}/proxy/purge/2", data=b"", method="POST"),
+        timeout=10).read()
+    n0 = upstream_count()
+    box12: list = []
+    threads = [
+        threading.Thread(target=lambda: box12.append(
+            proxy_get("/notices/2", {"Accept-Language": "zh-CN"}, timeout=20)))
+        for _ in range(6)
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    statuses12 = sorted(r[0] for r in box12)
+    check("6 个并发 = 3 个 200 + 3 个 502（部分失败）",
+          statuses12 == [200, 200, 200, 502, 502, 502], str(statuses12))
+    check("成功的含首请求 MISS-NO-CACHE",
+          sum(1 for r in box12
+              if r[1].get("x-cache") == "MISS-NO-CACHE") == 1,
+          str([r[1].get("x-cache") for r in box12]))
+    check("502 的全部标记 ERROR",
+          all(r[1].get("x-cache") == "ERROR" for r in box12 if r[0] == 502))
+    check("上游仍收到 6 次请求（失败不重试、不合并）",
+          upstream_count() - n0 == 6, f"delta={upstream_count() - n0}")
+    ok_rids = [r[1].get("x-upstream-request-id") for r in box12 if r[0] == 200]
+    check("成功响应的上游 ID 全不同", len(set(ok_rids)) == len(ok_rids),
+          str(ok_rids))
+
+    section("13. 批次结束后新请求不加入已结束的批次")
+    admin_post("/admin/config", {"notice_id": "2", "profile": "personal",
+                                 "failure": "none", "latency_ms": 100})
+    n0 = upstream_count()
+    s13, h13, _ = proxy_get("/notices/2", {"Accept-Language": "zh-CN"})
+    check("批次结束后再请求是全新首请求（MISS-NO-CACHE）",
+          h13.get("x-cache") == "MISS-NO-CACHE", h13.get("x-cache"))
+    check("新请求重新打了上游（未复用已结束批次的结果）",
+          upstream_count() - n0 == 1, f"delta={upstream_count() - n0}")
+    # personal 响应从未写入缓存：再请求仍 MISS-NO-CACHE
+    _, h13b, _ = proxy_get("/notices/2", {"Accept-Language": "zh-CN"})
+    check("personal 始终不缓存（再次 MISS-NO-CACHE）",
+          h13b.get("x-cache") == "MISS-NO-CACHE", h13b.get("x-cache"))
 
     print(f"\n========== 结果：{PASS} 通过 / {FAIL} 失败 ==========")
     return 1 if FAIL else 0

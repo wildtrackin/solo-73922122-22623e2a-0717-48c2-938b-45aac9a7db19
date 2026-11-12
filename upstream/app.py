@@ -4,8 +4,12 @@
 - 公告内容按 Accept-Language 返回中/英双语；
 - 每个公告可切换 public / personal 响应：
   * public  -> Cache-Control: public, max-age=N（可缓存）
-  * personal -> Set-Cookie + Cache-Control: private, no-store（不可缓存）
-- 可配置人工延迟与失败模式（500 / 超长延迟触发代理超时）；
+  * personal -> Set-Cookie + Cache-Control: private, no-store（不可缓存）；
+    同时下发 X-Session-Preview 回显会话值（Set-Cookie 对浏览器 JS 不可见，
+    该头仅用于演示页展示"每个访客拿到各自的 SESSION"）；
+- 失败模式：none（正常）/ error500（全部 500）/ intermittent（间歇失败，
+  每 fail_every 个请求失败 1 次，用于演示拆分后独立取数的部分失败）；
+- 可配置人工延迟与 public 的 max-age；
 - 管理端可查看请求计数与最近请求记录，便于验证缓存与合并行为。
 """
 
@@ -58,7 +62,8 @@ NOTICES: dict[str, dict[str, dict[str, str]]] = {
 DEFAULT_CONFIG = {
     "profile": "public",        # public | personal
     "latency_ms": 200,
-    "failure": "none",          # none | error500
+    "failure": "none",          # none | error500 | intermittent
+    "fail_every": 2,            # intermittent：每 N 个请求失败 1 次
     "max_age": 30,
     "cache_control": None,      # 非空时作为原始 Cache-Control 直接下发
 }
@@ -69,6 +74,9 @@ state: dict[str, Any] = {
     "overrides": {},
     "content_version": 1,
     "started_at": time.time(),
+    # intermittent 模式的独立计数器：配置/重置时清零，
+    # 保证"配置后第 N 个请求失败"的演示与验证行为可复现
+    "intermittent_count": 0,
 }
 counters = {"total_requests": 0, "by_notice": {}, "by_profile": {}}
 request_log: deque[dict[str, Any]] = deque(maxlen=50)
@@ -149,6 +157,21 @@ async def get_notice(notice_id: str, request: Request) -> JSONResponse:
             headers=base_headers,
         )
 
+    if cfg["failure"] == "intermittent":
+        # 每 fail_every 个请求失败 1 次（独立计数器，配置时清零）
+        state["intermittent_count"] += 1
+        every = max(1, int(cfg.get("fail_every") or 1))
+        if state["intermittent_count"] % every == 0:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "simulated intermittent failure",
+                    "request_id": request_id,
+                    "intermittent_seq": state["intermittent_count"],
+                },
+                headers=base_headers,
+            )
+
     if notice_id not in NOTICES:
         return JSONResponse(
             status_code=404,
@@ -181,9 +204,11 @@ async def get_notice(notice_id: str, request: Request) -> JSONResponse:
     else:
         # 个人页面：显式私有、禁止缓存，并下发 Set-Cookie
         headers["Cache-Control"] = "private, no-store"
-        headers["Set-Cookie"] = (
-            f"SESSION=user-{request_id}; Path=/; HttpOnly; SameSite=Lax"
-        )
+        session_value = f"SESSION=user-{request_id}"
+        headers["Set-Cookie"] = f"{session_value}; Path=/; HttpOnly; SameSite=Lax"
+        # Set-Cookie 对浏览器 JS 不可见；该回显头仅供演示页展示
+        # "每个访客拿到各自的 SESSION"，代理白名单透传，不进入缓存。
+        headers["X-Session-Preview"] = session_value
 
     return JSONResponse(status_code=200, content=payload, headers=headers)
 
@@ -198,6 +223,7 @@ async def admin_state() -> dict[str, Any]:
         "overrides": state["overrides"],
         "content_version": state["content_version"],
         "counters": counters,
+        "intermittent_count": state["intermittent_count"],
         "uptime_seconds": round(time.time() - state["started_at"], 1),
     }
 
@@ -213,22 +239,43 @@ async def admin_config(payload: dict[str, Any]) -> dict[str, Any]:
     notice_id = payload.get("notice_id")
     fields = {
         k: payload[k]
-        for k in ("profile", "latency_ms", "failure", "max_age", "cache_control")
+        for k in (
+            "profile",
+            "latency_ms",
+            "failure",
+            "fail_every",
+            "max_age",
+            "cache_control",
+        )
         if k in payload
     }
     if "profile" in fields and fields["profile"] not in ("public", "personal"):
         return JSONResponse(
             status_code=400, content={"error": "profile must be public|personal"}
         )
-    if "failure" in fields and fields["failure"] not in ("none", "error500"):
+    if "failure" in fields and fields["failure"] not in (
+        "none",
+        "error500",
+        "intermittent",
+    ):
         return JSONResponse(
-            status_code=400, content={"error": "failure must be none|error500"}
+            status_code=400,
+            content={"error": "failure must be none|error500|intermittent"},
         )
+    if "fail_every" in fields:
+        try:
+            fields["fail_every"] = max(1, int(fields["fail_every"]))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                status_code=400, content={"error": "fail_every must be an int >= 1"}
+            )
     if notice_id:
         target = state["overrides"].setdefault(str(notice_id), {})
         target.update(fields)
     else:
         state["defaults"].update(fields)
+    # 失败模式相关配置变更后，间歇计数清零，保证演示行为可复现
+    state["intermittent_count"] = 0
     _bump_version()
     return {"ok": True, "state": await admin_state()}
 
@@ -237,6 +284,7 @@ async def admin_config(payload: dict[str, Any]) -> dict[str, Any]:
 async def admin_reset() -> dict[str, Any]:
     state["defaults"] = dict(DEFAULT_CONFIG)
     state["overrides"] = {}
+    state["intermittent_count"] = 0
     _bump_version()
     counters["total_requests"] = 0
     counters["by_notice"] = {}
